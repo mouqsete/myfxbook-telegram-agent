@@ -4,7 +4,7 @@ import sys
 import html
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import List, Dict, Optional
 
@@ -42,6 +42,8 @@ DATE_HEADER_RE = re.compile(
 )
 TIME_RE = re.compile(r"^([A-Z][a-z]{2}) (\d{2}), (\d{2}):(\d{2})$")
 CURRENCY_EVENT_RE = re.compile(r"^([A-Z]{3})\s+(.+)$")
+CURRENCY_ONLY_RE = re.compile(r"^[A-Z]{3}$")
+TIME_LEFT_RE = re.compile(r"^(\d+\s*day[s]?|\d+h\s*\d+min|\d+\s*min|\d+\s*hour[s]?)$", re.I)
 IMPACT_VALUES = {"None", "Low", "Medium", "High"}
 
 
@@ -115,13 +117,60 @@ def parse_source_datetime(s: str, current_year: Optional[int] = None) -> Optiona
     return dt_source.astimezone(TARGET_TZ)
 
 
+def clean_text(value: str) -> str:
+    value = html.unescape(value or "")
+    value = re.sub(r"\s+", " ", value).strip()
+    # Myfxbook can include small UI artifacts in text extraction.
+    value = value.replace("Notification disabled", "").replace("Notification enabled", "").strip()
+    return value
+
+
 def clean_lines(page_html: str) -> List[str]:
     soup = BeautifulSoup(page_html, "html.parser")
     for tag in soup(["script", "style", "noscript", "svg"]):
         tag.decompose()
+
     text = soup.get_text("\n")
-    lines = [html.unescape(x.strip()) for x in text.splitlines()]
-    return [x for x in lines if x and x not in {"All", "None", "Calendar", "Economic Calendar"}]
+    raw_lines = [clean_text(x) for x in text.splitlines()]
+    lines = []
+    ignore = {
+        "", "All", "None", "Calendar", "Economic Calendar",
+        "Impact:", "Filter By:", "Currency", "Country",
+        "High Medium Low No Impact", "Enable All Disable All",
+    }
+    for line in raw_lines:
+        if not line or line in ignore:
+            continue
+        if line.startswith("Image:"):
+            continue
+        lines.append(line)
+    return lines
+
+
+def read_currency_and_title(lines: List[str], idx: int):
+    """Return (currency, title, next_index) or (None, None, idx). Handles:
+    1) 'USD JOLTs Job Openings (May)'
+    2) 'USD' then 'JOLTs Job Openings (May)'
+    """
+    if idx >= len(lines):
+        return None, None, idx
+
+    line = lines[idx]
+
+    m = CURRENCY_EVENT_RE.match(line)
+    if m:
+        currency, title = m.groups()
+        title = title.strip()
+        if title:
+            return currency, title, idx + 1
+
+    if CURRENCY_ONLY_RE.match(line) and idx + 1 < len(lines):
+        currency = line
+        title = lines[idx + 1].strip()
+        if title and title not in IMPACT_VALUES and not TIME_RE.match(title):
+            return currency, title, idx + 2
+
+    return None, None, idx
 
 
 def parse_events(page_html: str) -> List[Event]:
@@ -144,47 +193,42 @@ def parse_events(page_html: str) -> List[Event]:
             i += 1
             continue
 
-        # Expected layout:
-        # time line
-        # time left
-        # "USD Event Title"
-        # Impact
-        # Previous
-        # Consensus
-        # Actual optional
         j = i + 1
 
         # Skip "time left" like "2 days", "22h 38min"
-        if j < len(lines) and re.search(r"(day|days|h|min|left)", lines[j], re.I):
+        while j < len(lines) and TIME_LEFT_RE.match(lines[j]):
             j += 1
 
-        if j >= len(lines):
+        currency, title, j2 = read_currency_and_title(lines, j)
+        if not currency:
+            i += 1
+            continue
+        j = j2
+
+        # Find impact within the next few tokens
+        impact = None
+        impact_idx = j
+        for k in range(j, min(j + 8, len(lines))):
+            if lines[k] in IMPACT_VALUES:
+                impact = lines[k]
+                impact_idx = k
+                break
+
+        if not impact:
             i += 1
             continue
 
-        ce = CURRENCY_EVENT_RE.match(lines[j])
-        if not ce:
-            i += 1
-            continue
-
-        currency, title = ce.groups()
-        j += 1
-
-        if j >= len(lines) or lines[j] not in IMPACT_VALUES:
-            i += 1
-            continue
-
-        impact = lines[j]
-        j += 1
+        j = impact_idx + 1
 
         values = []
         while j < len(lines):
             if DATE_HEADER_RE.match(lines[j]) or TIME_RE.match(lines[j]):
                 break
-            # Stop if a new "USD Event" appears unexpectedly.
-            if CURRENCY_EVENT_RE.match(lines[j]) and len(values) > 0:
+            # Avoid accidentally consuming the next event if Myfxbook omits a time line.
+            c2, t2, _ = read_currency_and_title(lines, j)
+            if c2 and t2 and values:
                 break
-            if lines[j] not in IMPACT_VALUES:
+            if lines[j] not in IMPACT_VALUES and not TIME_LEFT_RE.match(lines[j]):
                 values.append(lines[j])
             j += 1
 
@@ -195,7 +239,7 @@ def parse_events(page_html: str) -> List[Event]:
         events.append(Event(
             dt_local=dt_local,
             currency=currency,
-            title=title.strip(),
+            title=title,
             impact=impact,
             previous=previous,
             consensus=consensus,
@@ -218,15 +262,24 @@ def filter_events(events: List[Event]) -> List[Event]:
     return sorted(filtered, key=lambda e: e.dt_local)
 
 
-def build_message(events: List[Event]) -> str:
+def build_message(events: List[Event], total_parsed: int) -> str:
     now = datetime.now(TARGET_TZ)
     title = f"📅 Calendrier économique — {now.strftime('%d/%m/%Y %H:%M')} ({TARGET_TZ.key})"
+
+    if total_parsed == 0:
+        return (
+            f"{title}\n\n"
+            "⚠️ Le bot a bien contacté Myfxbook, mais il n’a lu aucun événement.\n\n"
+            "Donc je ne peux pas considérer le calendrier comme fiable aujourd’hui.\n"
+            "Action : vérifier le calendrier manuellement avant de scalper, surtout avant NY."
+        )
 
     if not events:
         return (
             f"{title}\n\n"
             f"✅ Aucun événement {', '.join(sorted(IMPACTS))} pour {', '.join(sorted(CURRENCIES))} "
             f"dans les {LOOKAHEAD_DAYS} prochains jours.\n\n"
+            f"Info technique : {total_parsed} événements lus sur Myfxbook.\n"
             "Plan scalping : conditions normales, mais vérifie quand même le spread avant NY."
         )
 
@@ -234,7 +287,7 @@ def build_message(events: List[Event]) -> str:
     for e in events:
         grouped.setdefault(e.day_key, []).append(e)
 
-    parts = [title, ""]
+    parts = [title, f"Info technique : {total_parsed} événements lus sur Myfxbook.", ""]
     for day, items in grouped.items():
         parts.append(f"━━━━━━━━━━━━\n<b>{html.escape(day)}</b>")
         for e in items:
@@ -283,11 +336,14 @@ def send_telegram(message: str) -> None:
 def main() -> int:
     try:
         page = fetch_html()
-        events = filter_events(parse_events(page))
-        if not events and not SEND_EMPTY:
-            print("Aucun événement à envoyer.")
+        all_events = parse_events(page)
+        filtered_events = filter_events(all_events)
+
+        if not filtered_events and not SEND_EMPTY and all_events:
+            print("Aucun événement filtré à envoyer.")
             return 0
-        message = build_message(events)
+
+        message = build_message(filtered_events, total_parsed=len(all_events))
         print(message)
         send_telegram(message)
         return 0
