@@ -5,7 +5,10 @@ on:
   schedule:
     - cron: "17 8 * * *"
       timezone: "Africa/Casablanca"
-
+    - cron: "45 12 * * *"
+      timezone: "Africa/Casablanca"
+    - cron: "45 14 * * *"
+      timezone: "Africa/Casablanca"
 jobs:
   send-calendar:
     runs-on: ubuntu-latest
