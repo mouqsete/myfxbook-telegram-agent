@@ -3,21 +3,25 @@ import re
 import sys
 import html
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 import requests
 from bs4 import BeautifulSoup
 
 
 MYFXBOOK_URL = os.getenv("MYFXBOOK_URL", "https://www.myfxbook.com/forex-economic-calendar")
+FOREX_FACTORY_XML_URL = os.getenv("FOREX_FACTORY_XML_URL", "https://nfs.faireconomy.media/ff_calendar_thisweek.xml")
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 TARGET_TZ = ZoneInfo(os.getenv("TIMEZONE", "Africa/Casablanca"))
-SOURCE_TZ = ZoneInfo(os.getenv("SOURCE_TIMEZONE", "UTC"))
+MYFXBOOK_SOURCE_TZ = ZoneInfo(os.getenv("SOURCE_TIMEZONE", "UTC"))
+FOREX_FACTORY_TZ = ZoneInfo(os.getenv("FOREX_FACTORY_TIMEZONE", "America/New_York"))
 
 CURRENCIES = {x.strip().upper() for x in os.getenv("CURRENCIES", "USD").split(",") if x.strip()}
 IMPACTS = {x.strip().title() for x in os.getenv("IMPACTS", "High").split(",") if x.strip()}
@@ -56,6 +60,7 @@ class Event:
     previous: str = ""
     consensus: str = ""
     actual: str = ""
+    source: str = ""
 
     @property
     def day_key(self) -> str:
@@ -67,7 +72,7 @@ class Event:
         red_words = [
             "non farm", "nonfarm", "nfp", "fomc", "fed chair", "powell", "warsh",
             "cpi", "ppi", "interest rate", "rate decision", "unemployment rate",
-            "jolts", "ism", "payroll", "jobless claims", "gdp"
+            "jolts", "ism", "payroll", "jobless claims", "gdp", "claims"
         ]
         if self.impact == "High" and any(w in name for w in red_words):
             return "🔴 ROUGE"
@@ -88,39 +93,38 @@ class Event:
         return f"{start.strftime('%H:%M')} → {end.strftime('%H:%M')}"
 
 
-def fetch_html() -> str:
+def request_text(url: str) -> str:
     headers = {
         "User-Agent": USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml,text/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
         "Cache-Control": "no-cache",
     }
     last_error = None
     for attempt in range(3):
         try:
-            r = requests.get(MYFXBOOK_URL, headers=headers, timeout=25)
+            r = requests.get(url, headers=headers, timeout=25)
             r.raise_for_status()
             return r.text
         except Exception as exc:
             last_error = exc
             time.sleep(2 + attempt)
-    raise RuntimeError(f"Impossible de lire Myfxbook après 3 essais: {last_error}")
+    raise RuntimeError(f"Impossible de lire {url} après 3 essais: {last_error}")
 
 
-def parse_source_datetime(s: str, current_year: Optional[int] = None) -> Optional[datetime]:
+def parse_myfxbook_datetime(s: str, current_year: Optional[int] = None) -> Optional[datetime]:
     m = TIME_RE.match(s)
     if not m:
         return None
     mon, dd, hh, mm = m.groups()
     year = current_year or datetime.now(TARGET_TZ).year
-    dt_source = datetime(year, MONTHS[mon], int(dd), int(hh), int(mm), tzinfo=SOURCE_TZ)
+    dt_source = datetime(year, MONTHS[mon], int(dd), int(hh), int(mm), tzinfo=MYFXBOOK_SOURCE_TZ)
     return dt_source.astimezone(TARGET_TZ)
 
 
 def clean_text(value: str) -> str:
     value = html.unescape(value or "")
     value = re.sub(r"\s+", " ", value).strip()
-    # Myfxbook can include small UI artifacts in text extraction.
     value = value.replace("Notification disabled", "").replace("Notification enabled", "").strip()
     return value
 
@@ -129,7 +133,6 @@ def clean_lines(page_html: str) -> List[str]:
     soup = BeautifulSoup(page_html, "html.parser")
     for tag in soup(["script", "style", "noscript", "svg"]):
         tag.decompose()
-
     text = soup.get_text("\n")
     raw_lines = [clean_text(x) for x in text.splitlines()]
     lines = []
@@ -148,64 +151,47 @@ def clean_lines(page_html: str) -> List[str]:
 
 
 def read_currency_and_title(lines: List[str], idx: int):
-    """Return (currency, title, next_index) or (None, None, idx). Handles:
-    1) 'USD JOLTs Job Openings (May)'
-    2) 'USD' then 'JOLTs Job Openings (May)'
-    """
     if idx >= len(lines):
         return None, None, idx
-
     line = lines[idx]
-
     m = CURRENCY_EVENT_RE.match(line)
     if m:
         currency, title = m.groups()
         title = title.strip()
         if title:
             return currency, title, idx + 1
-
     if CURRENCY_ONLY_RE.match(line) and idx + 1 < len(lines):
         currency = line
         title = lines[idx + 1].strip()
         if title and title not in IMPACT_VALUES and not TIME_RE.match(title):
             return currency, title, idx + 2
-
     return None, None, idx
 
 
-def parse_events(page_html: str) -> List[Event]:
+def parse_myfxbook_page(page_html: str) -> List[Event]:
     lines = clean_lines(page_html)
     events: List[Event] = []
     current_year = datetime.now(TARGET_TZ).year
     i = 0
-
     while i < len(lines):
         line = lines[i]
-
         header = DATE_HEADER_RE.match(line)
         if header:
             current_year = int(header.group(4))
             i += 1
             continue
-
-        dt_local = parse_source_datetime(line, current_year)
+        dt_local = parse_myfxbook_datetime(line, current_year)
         if not dt_local:
             i += 1
             continue
-
         j = i + 1
-
-        # Skip "time left" like "2 days", "22h 38min"
         while j < len(lines) and TIME_LEFT_RE.match(lines[j]):
             j += 1
-
         currency, title, j2 = read_currency_and_title(lines, j)
         if not currency:
             i += 1
             continue
         j = j2
-
-        # Find impact within the next few tokens
         impact = None
         impact_idx = j
         for k in range(j, min(j + 8, len(lines))):
@@ -213,81 +199,144 @@ def parse_events(page_html: str) -> List[Event]:
                 impact = lines[k]
                 impact_idx = k
                 break
-
         if not impact:
             i += 1
             continue
-
         j = impact_idx + 1
-
         values = []
         while j < len(lines):
             if DATE_HEADER_RE.match(lines[j]) or TIME_RE.match(lines[j]):
                 break
-            # Avoid accidentally consuming the next event if Myfxbook omits a time line.
             c2, t2, _ = read_currency_and_title(lines, j)
             if c2 and t2 and values:
                 break
             if lines[j] not in IMPACT_VALUES and not TIME_LEFT_RE.match(lines[j]):
                 values.append(lines[j])
             j += 1
-
         previous = values[0] if len(values) >= 1 else ""
         consensus = values[1] if len(values) >= 2 else ""
         actual = values[2] if len(values) >= 3 else ""
-
-        events.append(Event(
-            dt_local=dt_local,
-            currency=currency,
-            title=title,
-            impact=impact,
-            previous=previous,
-            consensus=consensus,
-            actual=actual,
-        ))
+        events.append(Event(dt_local, currency, title, impact, previous, consensus, actual, "Myfxbook"))
         i = j
+    return events
 
+
+def node_text(node, tag: str) -> str:
+    found = node.find(tag)
+    return clean_text(found.text if found is not None and found.text is not None else "")
+
+
+def parse_forex_factory_time(date_s: str, time_s: str) -> Optional[datetime]:
+    date_s = clean_text(date_s)
+    time_s = clean_text(time_s).lower().replace(" ", "")
+    if not date_s:
+        return None
+    try:
+        base_date = datetime.strptime(date_s, "%m-%d-%Y").date()
+    except ValueError:
+        try:
+            base_date = datetime.strptime(date_s, "%m/%d/%Y").date()
+        except ValueError:
+            return None
+    if not time_s or time_s in {"allday", "tentative"}:
+        hour, minute = 0, 0
+    else:
+        try:
+            t = datetime.strptime(time_s, "%I:%M%p").time()
+            hour, minute = t.hour, t.minute
+        except ValueError:
+            try:
+                t = datetime.strptime(time_s, "%I%p").time()
+                hour, minute = t.hour, t.minute
+            except ValueError:
+                return None
+    dt_source = datetime(base_date.year, base_date.month, base_date.day, hour, minute, tzinfo=FOREX_FACTORY_TZ)
+    return dt_source.astimezone(TARGET_TZ)
+
+
+def normalize_impact(value: str) -> str:
+    v = clean_text(value).lower()
+    if "high" in v:
+        return "High"
+    if "medium" in v or "med" in v:
+        return "Medium"
+    if "low" in v:
+        return "Low"
+    if "holiday" in v or "none" in v:
+        return "None"
+    return clean_text(value).title()
+
+
+def parse_forex_factory_xml(xml_text: str) -> List[Event]:
+    events: List[Event] = []
+    root = ET.fromstring(xml_text)
+    candidates = root.findall(".//event") or root.findall(".//item")
+    for ev in candidates:
+        title = node_text(ev, "title")
+        currency = node_text(ev, "country") or node_text(ev, "currency")
+        impact = normalize_impact(node_text(ev, "impact"))
+        date_s = node_text(ev, "date")
+        time_s = node_text(ev, "time")
+        previous = node_text(ev, "previous")
+        consensus = node_text(ev, "forecast") or node_text(ev, "consensus")
+        actual = node_text(ev, "actual")
+        if not currency and title:
+            m = re.search(r"\b([A-Z]{3})\b", title)
+            currency = m.group(1) if m else ""
+        dt_local = parse_forex_factory_time(date_s, time_s)
+        if not dt_local or not currency or not title or impact not in IMPACT_VALUES:
+            continue
+        events.append(Event(dt_local, currency.upper(), title, impact, previous, consensus, actual, "ForexFactory XML fallback"))
     return events
 
 
 def filter_events(events: List[Event]) -> List[Event]:
     now = datetime.now(TARGET_TZ)
     end = now + timedelta(days=LOOKAHEAD_DAYS)
-    filtered = [
+    return sorted([
         e for e in events
         if now.date() <= e.dt_local.date() <= end.date()
         and e.currency in CURRENCIES
         and e.impact in IMPACTS
-    ]
-    return sorted(filtered, key=lambda e: e.dt_local)
+    ], key=lambda e: e.dt_local)
 
 
-def build_message(events: List[Event], total_parsed: int) -> str:
+def get_events_with_fallback() -> Tuple[List[Event], int, str]:
+    errors = []
+    try:
+        page = request_text(MYFXBOOK_URL)
+        myfx_events = parse_myfxbook_page(page)
+        if myfx_events:
+            return filter_events(myfx_events), len(myfx_events), "Myfxbook"
+        errors.append("Myfxbook lu, mais 0 événement reconnu.")
+    except Exception as exc:
+        errors.append(f"Myfxbook erreur: {exc}")
+    try:
+        xml_text = request_text(FOREX_FACTORY_XML_URL)
+        ff_events = parse_forex_factory_xml(xml_text)
+        if ff_events:
+            return filter_events(ff_events), len(ff_events), "ForexFactory XML fallback"
+        errors.append("ForexFactory XML lu, mais 0 événement reconnu.")
+    except Exception as exc:
+        errors.append(f"ForexFactory XML erreur: {exc}")
+    raise RuntimeError("Aucune source calendrier fiable aujourd'hui. " + " | ".join(errors))
+
+
+def build_message(events: List[Event], total_parsed: int, source: str) -> str:
     now = datetime.now(TARGET_TZ)
     title = f"📅 Calendrier économique — {now.strftime('%d/%m/%Y %H:%M')} ({TARGET_TZ.key})"
-
-    if total_parsed == 0:
-        return (
-            f"{title}\n\n"
-            "⚠️ Le bot a bien contacté Myfxbook, mais il n’a lu aucun événement.\n\n"
-            "Donc je ne peux pas considérer le calendrier comme fiable aujourd’hui.\n"
-            "Action : vérifier le calendrier manuellement avant de scalper, surtout avant NY."
-        )
-
+    source_line = f"Source: {html.escape(source)} | {total_parsed} événements lus."
     if not events:
         return (
-            f"{title}\n\n"
+            f"{title}\n{source_line}\n\n"
             f"✅ Aucun événement {', '.join(sorted(IMPACTS))} pour {', '.join(sorted(CURRENCIES))} "
             f"dans les {LOOKAHEAD_DAYS} prochains jours.\n\n"
-            f"Info technique : {total_parsed} événements lus sur Myfxbook.\n"
             "Plan scalping : conditions normales, mais vérifie quand même le spread avant NY."
         )
-
     grouped: Dict[str, List[Event]] = {}
     for e in events:
         grouped.setdefault(e.day_key, []).append(e)
-
-    parts = [title, f"Info technique : {total_parsed} événements lus sur Myfxbook.", ""]
+    parts = [title, source_line, ""]
     for day, items in grouped.items():
         parts.append(f"━━━━━━━━━━━━\n<b>{html.escape(day)}</b>")
         for e in items:
@@ -299,7 +348,6 @@ def build_message(events: List[Event], total_parsed: int) -> str:
             if e.actual:
                 values.append(f"Act {html.escape(e.actual)}")
             value_txt = " | ".join(values)
-
             line = (
                 f"\n{e.risk_level} <b>{e.dt_local.strftime('%H:%M')}</b> "
                 f"{html.escape(e.currency)} — {html.escape(e.title)}\n"
@@ -308,7 +356,6 @@ def build_message(events: List[Event], total_parsed: int) -> str:
             if value_txt:
                 line += f"\n{value_txt}"
             parts.append(line)
-
     parts.append(
         "\n━━━━━━━━━━━━\n"
         "Règle scalping : pas d'entrée 30 min avant/après une news High. "
@@ -320,7 +367,6 @@ def build_message(events: List[Event], total_parsed: int) -> str:
 def send_telegram(message: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         raise RuntimeError("Secrets Telegram manquants: TELEGRAM_BOT_TOKEN et/ou TELEGRAM_CHAT_ID")
-
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -335,20 +381,20 @@ def send_telegram(message: str) -> None:
 
 def main() -> int:
     try:
-        page = fetch_html()
-        all_events = parse_events(page)
-        filtered_events = filter_events(all_events)
-
-        if not filtered_events and not SEND_EMPTY and all_events:
+        events, total_parsed, source = get_events_with_fallback()
+        if not events and not SEND_EMPTY:
             print("Aucun événement filtré à envoyer.")
             return 0
-
-        message = build_message(filtered_events, total_parsed=len(all_events))
+        message = build_message(events, total_parsed=total_parsed, source=source)
         print(message)
         send_telegram(message)
         return 0
     except Exception as exc:
-        error_msg = f"⚠️ Agent calendrier économique: erreur\n\n{html.escape(str(exc))}"
+        error_msg = (
+            "⚠️ Agent calendrier économique: erreur\n\n"
+            f"{html.escape(str(exc))}\n\n"
+            "Action : vérifier le calendrier manuellement avant de scalper, surtout avant NY."
+        )
         print(error_msg, file=sys.stderr)
         try:
             if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
